@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block title %}Request Received | Summit Ct{% endblock %}
+{% block content %}
+<section class="panel success-panel">
+  <p class="eyebrow">Request received</p>
+  <h1>Your booking is pending approval</h1>
+  <p>Keep this five-character reference safe:</p>
+  <div class="reference">{{ booking.reference }}</div>
+  <dl class="summary-list">
+    <div><dt>Name</dt><dd>{{ booking.guest_name }}</dd></div>
+    <div><dt>Dates</dt><dd>{{ booking.arrival_date.strftime('%b %d, %Y') }} – {{ booking.departure_date.strftime('%b %d, %Y') }}</dd></div>
+    <div><dt>Status</dt><dd><span class="status pending">Pending</span></dd></div>
+  </dl>
+  <p class="muted">The owner will review the request. Email notifications will be added in a future release.</p>
+  <div class="actions">
+    <a class="button primary" href="{{ url_for('manage_booking', token=token) }}">View or manage request</a>
+    <a class="button secondary" href="{{ url_for('home') }}">Return home</a>
+  </div>
+</section>
+{% endblock %}
