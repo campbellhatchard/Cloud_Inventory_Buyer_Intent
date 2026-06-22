@@ -1,0 +1,44 @@
+{% extends 'base.html' %}
+{% block title %}Manage {{ booking.reference }} | Summit Ct{% endblock %}
+{% block content %}
+<section class="panel">
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Booking {{ booking.reference }}</p>
+      <h1>{{ booking.guest_name }}</h1>
+    </div>
+    <span class="status {{ booking.status }}">{{ booking.status|capitalize }}</span>
+  </div>
+
+  <dl class="summary-list">
+    <div><dt>Arrival</dt><dd>{{ booking.arrival_date.strftime('%b %d, %Y') }}</dd></div>
+    <div><dt>Departure</dt><dd>{{ booking.departure_date.strftime('%b %d, %Y') }}</dd></div>
+    <div><dt>Email</dt><dd>{{ booking.email or 'Not provided' }}</dd></div>
+    <div><dt>Phone</dt><dd>{{ booking.phone or 'Not provided' }}</dd></div>
+  </dl>
+
+  {% if booking.status in ['pending','approved'] %}
+  <hr>
+  <h2>Change dates</h2>
+  <form method="post" class="form-grid">
+    <input type="hidden" name="action" value="change">
+    <label>Arrival
+      <input type="date" name="arrival_date" value="{{ booking.arrival_date.isoformat() }}" required>
+    </label>
+    <label>Departure
+      <input type="date" name="departure_date" value="{{ booking.departure_date.isoformat() }}" required>
+    </label>
+    <div class="full actions">
+      <button class="button primary" type="submit">Request change</button>
+    </div>
+  </form>
+
+  <form method="post" class="danger-zone" onsubmit="return confirm('Cancel this booking?');">
+    <input type="hidden" name="action" value="cancel">
+    <button class="button danger" type="submit">Cancel booking</button>
+  </form>
+  {% else %}
+    <div class="empty-state">This booking is no longer active and cannot be changed.</div>
+  {% endif %}
+</section>
+{% endblock %}
