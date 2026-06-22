@@ -1,291 +1,359 @@
 import os
-import sqlite3
 import secrets
 import string
-from datetime import datetime, date
+from datetime import date, datetime
+from functools import wraps
 
-from flask import Flask, g, render_template, request, redirect, url_for, flash, session
-
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "replace-this-secret")
-DATABASE = os.environ.get(
-    "DATABASE_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.db"),
-)
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "campbell.hatchard@gmail.com")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me-before-use")
+from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask_sqlalchemy import SQLAlchemy
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from sqlalchemy import CheckConstraint, Index, and_, func
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
-def get_db() -> sqlite3.Connection:
-    db = getattr(g, "_database", None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-    return db
+db = SQLAlchemy()
 
 
-@app.teardown_appcontext
-def close_connection(exception: Exception | None):
-    db = getattr(g, "_database", None)
-    if db is not None:
-        db.close()
+class Booking(db.Model):
+    __tablename__ = "bookings"
 
-
-def init_db() -> None:
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ref_code TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            email TEXT,
-            phone TEXT,
-            start_date DATE NOT NULL,
-            end_date DATE NOT NULL,
-            status TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """
+    id = db.Column(db.Integer, primary_key=True)
+    reference = db.Column(db.String(5), unique=True, nullable=False, index=True)
+    guest_name = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(255))
+    phone = db.Column(db.String(40))
+    arrival_date = db.Column(db.Date, nullable=False)
+    departure_date = db.Column(db.Date, nullable=False)
+    status = db.Column(db.String(20), nullable=False, default="pending", index=True)
+    guest_token_version = db.Column(db.Integer, nullable=False, default=1)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
     )
-    conn.commit()
+
+    __table_args__ = (
+        CheckConstraint("departure_date >= arrival_date", name="valid_booking_dates"),
+        CheckConstraint(
+            "status IN ('pending','approved','declined','cancelled')",
+            name="valid_booking_status",
+        ),
+        Index("ix_booking_active_dates", "status", "arrival_date", "departure_date"),
+    )
 
 
-def generate_ref_code(length: int = 5) -> str:
-    chars = string.ascii_uppercase + string.digits
-    conn = get_db()
+class AdminUser(db.Model):
+    __tablename__ = "admin_users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+class AuditEvent(db.Model):
+    __tablename__ = "audit_events"
+
+    id = db.Column(db.Integer, primary_key=True)
+    booking_id = db.Column(db.Integer, db.ForeignKey("bookings.id"), nullable=True)
+    event_type = db.Column(db.String(60), nullable=False)
+    actor = db.Column(db.String(255), nullable=False)
+    details = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+    app.config.update(
+        SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+        SQLALCHEMY_DATABASE_URI=os.environ.get("DATABASE_URL", "sqlite:///summitct.db").replace(
+            "postgres://", "postgresql://", 1
+        ),
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.environ.get("FLASK_ENV") == "production",
+        PERMANENT_SESSION_LIFETIME=3600,
+        ADMIN_USERNAME=os.environ.get("ADMIN_USERNAME", "campbell.hatchard@gmail.com"),
+        ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD", "change-me-before-use"),
+        TOKEN_MAX_AGE=int(os.environ.get("TOKEN_MAX_AGE", "31536000")),
+    )
+
+    db.init_app(app)
+
+    with app.app_context():
+        db.create_all()
+        ensure_admin(app)
+
+    register_routes(app)
+    return app
+
+
+def ensure_admin(app: Flask) -> None:
+    username = app.config["ADMIN_USERNAME"].strip().lower()
+    password = app.config["ADMIN_PASSWORD"]
+    admin = AdminUser.query.filter(func.lower(AdminUser.username) == username).first()
+    if admin is None:
+        db.session.add(
+            AdminUser(username=username, password_hash=generate_password_hash(password))
+        )
+        db.session.commit()
+
+
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("admin_user_id"):
+            return redirect(url_for("admin_login", next=request.path))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def serializer(app: Flask) -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="summitct-booking")
+
+
+def guest_token(app: Flask, booking: Booking) -> str:
+    return serializer(app).dumps(
+        {"booking_id": booking.id, "version": booking.guest_token_version}
+    )
+
+
+def resolve_guest_token(app: Flask, token: str) -> Booking:
+    try:
+        payload = serializer(app).loads(
+            token, max_age=app.config["TOKEN_MAX_AGE"]
+        )
+    except SignatureExpired:
+        abort(410)
+    except BadSignature:
+        abort(404)
+
+    booking = db.session.get(Booking, payload.get("booking_id"))
+    if booking is None or booking.guest_token_version != payload.get("version"):
+        abort(404)
+    return booking
+
+
+def create_reference() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     while True:
-        code = "".join(secrets.choice(chars) for _ in range(length))
-        if conn.execute("SELECT id FROM bookings WHERE ref_code = ?", (code,)).fetchone() is None:
-            return code
+        reference = "".join(secrets.choice(alphabet) for _ in range(5))
+        if not Booking.query.filter_by(reference=reference).first():
+            return reference
 
 
-def parse_date(value: str) -> date:
-    return datetime.strptime(value, "%Y-%m-%d").date()
-
-
-def overlap_exists(start: date, end: date, exclude_id: int | None = None) -> bool:
-    conn = get_db()
-    params: list = [end.isoformat(), start.isoformat()]
-    sql = (
-        "SELECT id FROM bookings "
-        "WHERE status IN ('approved', 'pending') "
-        "AND start_date <= ? AND end_date >= ?"
+def has_overlap(arrival: date, departure: date, exclude_id: int | None = None) -> bool:
+    query = Booking.query.filter(
+        Booking.status.in_(["pending", "approved"]),
+        Booking.arrival_date <= departure,
+        Booking.departure_date >= arrival,
     )
     if exclude_id is not None:
-        sql += " AND id != ?"
-        params.append(exclude_id)
-    return conn.execute(sql, params).fetchone() is not None
+        query = query.filter(Booking.id != exclude_id)
+    return db.session.query(query.exists()).scalar()
 
 
-def get_booking_by_code(code: str) -> sqlite3.Row | None:
-    return get_db().execute(
-        "SELECT * FROM bookings WHERE upper(ref_code) = upper(?)", (code,)
-    ).fetchone()
+def pending_exists(exclude_id: int | None = None) -> bool:
+    query = Booking.query.filter_by(status="pending")
+    if exclude_id is not None:
+        query = query.filter(Booking.id != exclude_id)
+    return db.session.query(query.exists()).scalar()
 
 
-with app.app_context():
-    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
-    init_db()
-
-
-@app.route("/")
-def index():
-    rows = get_db().execute(
-        "SELECT start_date, end_date FROM bookings WHERE status = 'approved' ORDER BY start_date"
-    ).fetchall()
-    busy_ranges = [(r["start_date"], r["end_date"]) for r in rows]
-    return render_template("index.html", busy_ranges=busy_ranges)
-
-
-@app.route("/request", methods=["GET", "POST"])
-def request_booking():
-    if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip()
-        phone = request.form.get("phone", "").strip()
-        start_str = request.form.get("start_date", "").strip()
-        end_str = request.form.get("end_date", "").strip()
-
-        if not name:
-            flash("Please provide your name.", "error")
-            return render_template("request.html", name=name, email=email, phone=phone)
-        if not start_str or not end_str:
-            flash("Please provide both start and end dates.", "error")
-            return render_template("request.html", name=name, email=email, phone=phone)
-
-        try:
-            start_date_obj = parse_date(start_str)
-            end_date_obj = parse_date(end_str)
-        except ValueError:
-            flash("Invalid date format.", "error")
-            return render_template("request.html", name=name, email=email, phone=phone)
-
-        if start_date_obj < date.today():
-            flash("The start date cannot be in the past.", "error")
-            return render_template("request.html", name=name, email=email, phone=phone)
-        if end_date_obj < start_date_obj:
-            flash("End date must be on or after the start date.", "error")
-            return render_template("request.html", name=name, email=email, phone=phone)
-
-        conn = get_db()
-        pending_count = conn.execute(
-            "SELECT COUNT(*) AS count FROM bookings WHERE status = 'pending'"
-        ).fetchone()["count"]
-        if pending_count > 0:
-            return render_template("pending_limit.html")
-
-        if overlap_exists(start_date_obj, end_date_obj):
-            return render_template("request_unavailable.html", start=start_str, end=end_str)
-
-        ref_code = generate_ref_code()
-        conn.execute(
-            "INSERT INTO bookings (ref_code, name, email, phone, start_date, end_date, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-            (ref_code, name, email, phone, start_str, end_str),
+def audit(event_type: str, actor: str, booking: Booking | None = None, details: str = ""):
+    db.session.add(
+        AuditEvent(
+            booking_id=booking.id if booking else None,
+            event_type=event_type,
+            actor=actor,
+            details=details,
         )
-        conn.commit()
-        return render_template("request_success.html", ref_code=ref_code)
-
-    return render_template("request.html")
+    )
 
 
-@app.route("/search", methods=["GET", "POST"])
-def search_booking():
-    if request.method == "POST":
-        code = request.form.get("ref_code", "").strip().upper()
-        if not code:
-            flash("Please enter your booking reference.", "error")
-            return render_template("search.html")
-        return redirect(url_for("view_booking", ref_code=code))
-    return render_template("search.html")
+def register_routes(app: Flask) -> None:
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}, 200
 
+    @app.get("/")
+    def home():
+        approved = Booking.query.filter(
+            Booking.status == "approved", Booking.departure_date >= date.today()
+        ).order_by(Booking.arrival_date).all()
+        return render_template("home.html", approved=approved)
 
-@app.route("/booking/<ref_code>", methods=["GET", "POST"])
-def view_booking(ref_code: str):
-    booking = get_booking_by_code(ref_code)
-    if booking is None:
-        return render_template("booking_not_found.html", ref_code=ref_code)
+    @app.route("/request", methods=["GET", "POST"])
+    def request_booking():
+        if request.method == "POST":
+            name = request.form.get("name", "").strip()
+            email = request.form.get("email", "").strip()
+            phone = request.form.get("phone", "").strip()
+            arrival_raw = request.form.get("arrival_date", "")
+            departure_raw = request.form.get("departure_date", "")
 
-    if request.method == "POST":
-        action = request.form.get("action")
-        if action == "cancel":
-            if booking["status"] in ("cancelled", "declined"):
-                flash("This booking is already inactive.", "info")
-            else:
-                get_db().execute(
-                    "UPDATE bookings SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (booking["id"],),
-                )
-                get_db().commit()
-                flash("Your booking has been cancelled.", "success")
-            booking = get_booking_by_code(ref_code)
-
-        elif action == "update":
-            new_start = request.form.get("new_start_date", "").strip()
-            new_end = request.form.get("new_end_date", "").strip()
             try:
-                new_start_obj = parse_date(new_start)
-                new_end_obj = parse_date(new_end)
+                arrival = date.fromisoformat(arrival_raw)
+                departure = date.fromisoformat(departure_raw)
             except ValueError:
-                flash("Invalid date format.", "error")
-                return render_template("booking_detail.html", booking=booking)
+                flash("Please enter valid dates.", "danger")
+                return render_template("request_booking.html")
 
-            if new_start_obj < date.today():
-                flash("The start date cannot be in the past.", "error")
-                return render_template("booking_detail.html", booking=booking)
-            if new_end_obj < new_start_obj:
-                flash("End date must be on or after the start date.", "error")
-                return render_template("booking_detail.html", booking=booking)
-            if overlap_exists(new_start_obj, new_end_obj, exclude_id=booking["id"]):
-                flash("Those dates are not available.", "error")
-                return render_template("booking_detail.html", booking=booking)
+            if not name:
+                flash("Name is required.", "danger")
+            elif arrival < date.today():
+                flash("Arrival cannot be in the past.", "danger")
+            elif departure < arrival:
+                flash("Departure must be on or after arrival.", "danger")
+            elif pending_exists():
+                flash(
+                    "Another request is currently awaiting review. Please try again later.",
+                    "warning",
+                )
+            elif has_overlap(arrival, departure):
+                flash("Those dates are unavailable.", "warning")
+            else:
+                booking = Booking(
+                    reference=create_reference(),
+                    guest_name=name,
+                    email=email or None,
+                    phone=phone or None,
+                    arrival_date=arrival,
+                    departure_date=departure,
+                    status="pending",
+                )
+                db.session.add(booking)
+                db.session.flush()
+                audit("booking_requested", name, booking)
+                db.session.commit()
+                token = guest_token(app, booking)
+                return render_template(
+                    "request_success.html", booking=booking, token=token
+                )
 
-            get_db().execute(
-                "UPDATE bookings SET start_date = ?, end_date = ?, status = 'pending', "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (new_start, new_end, booking["id"]),
-            )
-            get_db().commit()
-            flash("Your booking dates have been updated and are awaiting approval.", "success")
-            booking = get_booking_by_code(ref_code)
+        return render_template("request_booking.html")
 
-    return render_template("booking_detail.html", booking=booking)
+    @app.route("/find", methods=["GET", "POST"])
+    def find_booking():
+        if request.method == "POST":
+            reference = request.form.get("reference", "").strip().upper()
+            booking = Booking.query.filter_by(reference=reference).first()
+            if booking is None:
+                flash("Booking not found.", "danger")
+            else:
+                return redirect(
+                    url_for("manage_booking", token=guest_token(app, booking))
+                )
+        return render_template("find_booking.html")
+
+    @app.route("/booking/<token>", methods=["GET", "POST"])
+    def manage_booking(token: str):
+        booking = resolve_guest_token(app, token)
+
+        if request.method == "POST":
+            action = request.form.get("action")
+            if action == "cancel" and booking.status in {"pending", "approved"}:
+                booking.status = "cancelled"
+                booking.guest_token_version += 1
+                audit("booking_cancelled", booking.guest_name, booking)
+                db.session.commit()
+                flash("Your booking has been cancelled.", "success")
+                return redirect(url_for("home"))
+
+            if action == "change" and booking.status in {"pending", "approved"}:
+                try:
+                    arrival = date.fromisoformat(request.form.get("arrival_date", ""))
+                    departure = date.fromisoformat(request.form.get("departure_date", ""))
+                except ValueError:
+                    flash("Please enter valid dates.", "danger")
+                    return render_template("manage_booking.html", booking=booking, token=token)
+
+                if arrival < date.today() or departure < arrival:
+                    flash("The requested date range is invalid.", "danger")
+                elif pending_exists(exclude_id=booking.id):
+                    flash("Another request is currently awaiting review.", "warning")
+                elif has_overlap(arrival, departure, exclude_id=booking.id):
+                    flash("Those dates are unavailable.", "warning")
+                else:
+                    booking.arrival_date = arrival
+                    booking.departure_date = departure
+                    booking.status = "pending"
+                    audit("booking_changed", booking.guest_name, booking)
+                    db.session.commit()
+                    flash("Your change request is awaiting approval.", "success")
+                    return redirect(url_for("manage_booking", token=token))
+
+        return render_template("manage_booking.html", booking=booking, token=token)
+
+    @app.route("/admin/login", methods=["GET", "POST"])
+    def admin_login():
+        if request.method == "POST":
+            username = request.form.get("username", "").strip().lower()
+            password = request.form.get("password", "")
+            admin = AdminUser.query.filter(func.lower(AdminUser.username) == username).first()
+            if admin and check_password_hash(admin.password_hash, password):
+                session.clear()
+                session["admin_user_id"] = admin.id
+                session.permanent = True
+                audit("admin_login", admin.username)
+                db.session.commit()
+                return redirect(request.args.get("next") or url_for("admin_dashboard"))
+            flash("Incorrect username or password.", "danger")
+        return render_template(
+            "admin_login.html", default_username=app.config["ADMIN_USERNAME"]
+        )
+
+    @app.post("/admin/logout")
+    @admin_required
+    def admin_logout():
+        session.clear()
+        return redirect(url_for("home"))
+
+    @app.get("/admin")
+    @admin_required
+    def admin_dashboard():
+        bookings = Booking.query.order_by(Booking.arrival_date.desc()).all()
+        return render_template("admin_dashboard.html", bookings=bookings)
+
+    @app.post("/admin/booking/<int:booking_id>/<action>")
+    @admin_required
+    def admin_booking_action(booking_id: int, action: str):
+        booking = db.session.get(Booking, booking_id)
+        if booking is None:
+            abort(404)
+
+        if action == "approve" and booking.status == "pending":
+            if has_overlap(booking.arrival_date, booking.departure_date, booking.id):
+                flash("The dates now conflict with another active booking.", "danger")
+            else:
+                booking.status = "approved"
+                audit("booking_approved", "admin", booking)
+                db.session.commit()
+                flash("Booking approved.", "success")
+        elif action == "decline" and booking.status == "pending":
+            booking.status = "declined"
+            booking.guest_token_version += 1
+            audit("booking_declined", "admin", booking)
+            db.session.commit()
+            flash("Booking declined.", "info")
+        elif action == "cancel" and booking.status in {"pending", "approved"}:
+            booking.status = "cancelled"
+            booking.guest_token_version += 1
+            audit("booking_cancelled_by_admin", "admin", booking)
+            db.session.commit()
+            flash("Booking cancelled.", "info")
+        else:
+            flash("That action is not available.", "warning")
+
+        return redirect(url_for("admin_dashboard"))
 
 
-def admin_required() -> bool:
-    return bool(session.get("admin"))
-
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        if username == ADMIN_USERNAME and secrets.compare_digest(password, ADMIN_PASSWORD):
-            session["admin"] = True
-            return redirect(url_for("admin_dashboard"))
-        flash("Incorrect username or password.", "error")
-    return render_template("admin_login.html", default_username=ADMIN_USERNAME)
-
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("admin", None)
-    return redirect(url_for("index"))
-
-
-@app.route("/admin")
-def admin_dashboard():
-    if not admin_required():
-        return redirect(url_for("admin_login"))
-    bookings = get_db().execute("SELECT * FROM bookings ORDER BY start_date").fetchall()
-    return render_template(
-        "admin_dashboard.html", bookings=bookings, ADMIN_USERNAME=ADMIN_USERNAME
-    )
-
-
-@app.route("/admin/approve/<int:booking_id>", methods=["POST"])
-def admin_approve(booking_id: int):
-    if not admin_required():
-        return redirect(url_for("admin_login"))
-    get_db().execute(
-        "UPDATE bookings SET status = 'approved', updated_at = CURRENT_TIMESTAMP "
-        "WHERE id = ? AND status = 'pending'",
-        (booking_id,),
-    )
-    get_db().commit()
-    flash("Booking approved.", "success")
-    return redirect(url_for("admin_dashboard"))
-
-
-@app.route("/admin/decline/<int:booking_id>", methods=["POST"])
-def admin_decline(booking_id: int):
-    if not admin_required():
-        return redirect(url_for("admin_login"))
-    get_db().execute(
-        "UPDATE bookings SET status = 'declined', updated_at = CURRENT_TIMESTAMP "
-        "WHERE id = ? AND status = 'pending'",
-        (booking_id,),
-    )
-    get_db().commit()
-    flash("Booking declined.", "info")
-    return redirect(url_for("admin_dashboard"))
-
-
-@app.route("/admin/cancel/<int:booking_id>", methods=["POST"])
-def admin_cancel(booking_id: int):
-    if not admin_required():
-        return redirect(url_for("admin_login"))
-    get_db().execute(
-        "UPDATE bookings SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (booking_id,),
-    )
-    get_db().commit()
-    flash("Booking cancelled.", "info")
-    return redirect(url_for("admin_dashboard"))
+app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
