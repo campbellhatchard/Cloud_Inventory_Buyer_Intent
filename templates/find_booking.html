@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block title %}Find Booking | Summit Ct{% endblock %}
+{% block content %}
+<section class="form-shell narrow">
+  <div>
+    <p class="eyebrow">Existing booking</p>
+    <h1>Find your booking</h1>
+    <p class="lead">Enter the five-character reference shown when the request was submitted.</p>
+  </div>
+  <form method="post" class="panel">
+    <label>Booking reference
+      <input name="reference" maxlength="5" minlength="5" required autocomplete="off" class="reference-input" placeholder="A2B3C">
+    </label>
+    <div class="actions">
+      <button class="button primary" type="submit">Find booking</button>
+    </div>
+  </form>
+</section>
+{% endblock %}
