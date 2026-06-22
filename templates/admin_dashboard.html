@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+{% block title %}Owner Dashboard | Summit Ct{% endblock %}
+{% block content %}
+<section class="section-heading">
+  <div>
+    <p class="eyebrow">Owner dashboard</p>
+    <h1>Booking requests</h1>
+  </div>
+  <form method="post" action="{{ url_for('admin_logout') }}">
+    <button class="button secondary" type="submit">Sign out</button>
+  </form>
+</section>
+
+<section class="panel table-wrap">
+  {% if bookings %}
+  <table>
+    <thead>
+      <tr><th>Reference</th><th>Guest</th><th>Dates</th><th>Contact</th><th>Status</th><th>Actions</th></tr>
+    </thead>
+    <tbody>
+      {% for booking in bookings %}
+      <tr>
+        <td><strong>{{ booking.reference }}</strong></td>
+        <td>{{ booking.guest_name }}</td>
+        <td>{{ booking.arrival_date.strftime('%b %d, %Y') }}<br><span class="muted">to {{ booking.departure_date.strftime('%b %d, %Y') }}</span></td>
+        <td>{{ booking.email or booking.phone or 'Not provided' }}</td>
+        <td><span class="status {{ booking.status }}">{{ booking.status|capitalize }}</span></td>
+        <td>
+          <div class="row-actions">
+          {% if booking.status == 'pending' %}
+            <form method="post" action="{{ url_for('admin_booking_action', booking_id=booking.id, action='approve') }}"><button class="mini approve" type="submit">Approve</button></form>
+            <form method="post" action="{{ url_for('admin_booking_action', booking_id=booking.id, action='decline') }}"><button class="mini decline" type="submit">Decline</button></form>
+          {% endif %}
+          {% if booking.status in ['pending','approved'] %}
+            <form method="post" action="{{ url_for('admin_booking_action', booking_id=booking.id, action='cancel') }}" onsubmit="return confirm('Cancel this booking?');"><button class="mini cancel" type="submit">Cancel</button></form>
+          {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div class="empty-state">No booking requests yet.</div>
+  {% endif %}
+</section>
+{% endblock %}
