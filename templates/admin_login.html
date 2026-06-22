@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}Owner Login | Summit Ct{% endblock %}
+{% block content %}
+<section class="form-shell narrow">
+  <div>
+    <p class="eyebrow">Owner access</p>
+    <h1>Sign in</h1>
+  </div>
+  <form method="post" class="panel">
+    <label>Username
+      <input type="email" name="username" value="{{ default_username }}" required autocomplete="username">
+    </label>
+    <label>Password
+      <input type="password" name="password" required autocomplete="current-password">
+    </label>
+    <div class="actions">
+      <button class="button primary" type="submit">Sign in</button>
+    </div>
+  </form>
+</section>
+{% endblock %}
