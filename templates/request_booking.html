@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block title %}Request a Stay | Summit Ct{% endblock %}
+{% block content %}
+<section class="form-shell">
+  <div>
+    <p class="eyebrow">Booking request</p>
+    <h1>Request your dates</h1>
+    <p class="lead">Submitting this form creates a pending request. The stay is only confirmed after owner approval.</p>
+  </div>
+  <form method="post" class="panel form-grid">
+    <label class="full">Name
+      <input name="name" value="{{ request.form.get('name','') }}" required maxlength="120" autocomplete="name">
+    </label>
+    <label>Email <span class="muted">optional</span>
+      <input type="email" name="email" value="{{ request.form.get('email','') }}" maxlength="255" autocomplete="email">
+    </label>
+    <label>Phone <span class="muted">optional</span>
+      <input type="tel" name="phone" value="{{ request.form.get('phone','') }}" maxlength="40" autocomplete="tel">
+    </label>
+    <label>Arrival
+      <input type="date" name="arrival_date" value="{{ request.form.get('arrival_date','') }}" required>
+    </label>
+    <label>Departure
+      <input type="date" name="departure_date" value="{{ request.form.get('departure_date','') }}" required>
+    </label>
+    <div class="full actions">
+      <button class="button primary" type="submit">Submit request</button>
+      <a class="button secondary" href="{{ url_for('home') }}">Cancel</a>
+    </div>
+  </form>
+</section>
+{% endblock %}
